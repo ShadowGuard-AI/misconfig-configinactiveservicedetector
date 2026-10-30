@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # misconfig-ConfigInactiveServiceDetector
 Detects configurations that enable services which are currently inactive or not being used, suggesting potential security vulnerabilities or resource wastage. - Focused on Check for misconfigurations in configuration files or infrastructure definitions
 
