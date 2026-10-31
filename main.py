@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import os
-import subprocess
 import sys
 import yaml
 
@@ -32,10 +31,10 @@ def is_service_active(service_name, active_services):
         active_services (set): A set of known active service names.
 
     Returns:
-        bool: True if the service is active, False otherwise.  Returns True if active_services is None (meaning we're not checking).
+        bool: True if the service is active, False otherwise.  Returns False if active_services is None, so every enabled service is reported when no list is given.
     """
     if active_services is None:
-        return True  # If no service list is provided, assume all are active
+        return False  # No service list: every enabled service is reported, per the help text.
 
     return service_name in active_services
 
@@ -64,55 +63,79 @@ def load_active_services(service_list_file):
         return None
 
 
+ENABLED_STRINGS = {"true", "yes", "on", "enabled", "1"}
+
+def is_enabled(value):
+    """Return True for common enabled forms: boolean True, 1, and enabled strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ENABLED_STRINGS
+    return False
+
+def collect_enabled(data, prefix=""):
+    """Walk nested mappings recursively and yield (service, dotted path) for enabled leaves."""
+    found = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                found.extend(collect_enabled(value, path))
+            elif is_enabled(value):
+                found.append((str(key), path))
+    return found
+
 def analyze_config_file(config_file, active_services=None):
     """
-    Analyzes a configuration file to detect inactive service configurations.
-
-    Args:
-        config_file (str): Path to the configuration file.
-        active_services (set): A set of known active service names.
+    Analyze one configuration file.
 
     Returns:
-        list: A list of dictionaries, each containing details about an inactive service configuration.
+        tuple: (inactive_services, status) where status is "ok" when the file
+        was loaded and held a non empty mapping, "empty" when it held no
+        configuration, and "error" when it could not be analyzed at all.
     """
     inactive_services = []
     try:
         file_ext = os.path.splitext(config_file)[1].lower()
-
         with open(config_file, 'r') as f:
             if file_ext in ['.yaml', '.yml']:
                 try:
                     data = yaml.safe_load(f)
                 except yaml.YAMLError as e:
                     logging.error(f"Error parsing YAML file {config_file}: {e}")
-                    return []
+                    return [], "error"
             elif file_ext == '.json':
                 try:
                     data = json.load(f)
                 except json.JSONDecodeError as e:
                     logging.error(f"Error parsing JSON file {config_file}: {e}")
-                    return []
+                    return [], "error"
             else:
-                logging.warning(f"Unsupported file type: {file_ext} for file {config_file}. Skipping.")
-                return []
-
-        # Basic logic:  This is a simplified example.  Adapt to your specific config structures.
-        # Assume the config is a dictionary and services are keys with boolean values (True=enabled).
-        if isinstance(data, dict):
-            for service, enabled in data.items():
-                if isinstance(enabled, bool) and enabled:  # Check if the service is enabled (True)
-                    if not is_service_active(service, active_services):
-                        inactive_services.append({
-                            'file': config_file,
-                            'service': service,
-                            'reason': 'Service is enabled in configuration but not listed as active.'
-                        })
+                logging.error(f"Unsupported file type: {file_ext} for file {config_file}. Not analyzed.")
+                return [], "error"
+        if data is None or (isinstance(data, dict) and not data):
+            logging.error(f"Configuration file {config_file} is empty. Nothing was analyzed.")
+            return [], "empty"
+        if not isinstance(data, dict):
+            logging.error(f"Configuration file {config_file} does not hold a mapping. Not analyzed.")
+            return [], "error"
+        for service, path in collect_enabled(data):
+            if not is_service_active(service, active_services):
+                inactive_services.append({
+                    'file': config_file,
+                    'service': service,
+                    'path': path,
+                    'reason': 'Service is enabled in configuration but not listed as active.'
+                })
     except FileNotFoundError:
         logging.error(f"Config file not found: {config_file}")
+        return [], "error"
     except Exception as e:
         logging.error(f"Error analyzing config file {config_file}: {e}")
-
-    return inactive_services
+        return [], "error"
+    return inactive_services, "ok"
 
 
 def main():
@@ -131,6 +154,13 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    if args.output:
+        resolved_output = os.path.realpath(args.output)
+        for config_file in args.config_files:
+            if os.path.realpath(config_file) == resolved_output:
+                logging.error(f"Output path '{args.output}' is the same as config input '{config_file}'. Refusing to overwrite the input.")
+                sys.exit(1)
+
     active_services = None
     if args.service_list:
         active_services = load_active_services(args.service_list)
@@ -139,8 +169,17 @@ def main():
           sys.exit(1)
     
     all_inactive_services = []
+    analysis_failed = False
+    analyzed_any = False
     for config_file in args.config_files:
-        all_inactive_services.extend(analyze_config_file(config_file, active_services))
+        findings, status = analyze_config_file(config_file, active_services)
+        all_inactive_services.extend(findings)
+        if status == "ok":
+            analyzed_any = True
+        else:
+            analysis_failed = True
+    if not analyzed_any:
+        analysis_failed = True
 
     if args.format == 'json':
         output_data = json.dumps(all_inactive_services, indent=4)
@@ -151,8 +190,12 @@ def main():
             for service in all_inactive_services:
                 output_data += f"  File: {service['file']}\n"
                 output_data += f"  Service: {service['service']}\n"
+                if service.get('path'):
+                    output_data += f"  Path: {service['path']}\n"
                 output_data += f"  Reason: {service['reason']}\n"
                 output_data += "\n"
+        elif analysis_failed:
+            output_data = "Analysis incomplete: one or more supplied files could not be analyzed."
         else:
             output_data = "No inactive service configurations found."
 
@@ -167,6 +210,8 @@ def main():
     else:
         print(output_data)
 
+    if analysis_failed:
+        sys.exit(1)  # At least one supplied file could not be analyzed.
     if all_inactive_services:
         sys.exit(1) # Return error code if issues were found.
     else:
