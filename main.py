@@ -36,6 +36,10 @@ def is_service_active(service_name, active_services):
     if active_services is None:
         return False  # No service list: every enabled service is reported, per the help text.
 
+    # Matching is exact and case sensitive. The list file entries
+    # were stripped of surrounding space when loaded, but their
+    # case was left as written, so Nginx in a config and nginx in
+    # the list are two different services to me.
     return service_name in active_services
 
 def load_active_services(service_list_file):
@@ -57,6 +61,11 @@ def load_active_services(service_list_file):
         return services
     except FileNotFoundError:
         logging.error(f"Active service list file not found: {service_list_file}")
+        # None covers a missing file and an empty one alike, and main
+        # treats both as a failed run when a list was named. The help
+        # text promise that an absent list means every enabled service
+        # is reported applies only when no list argument is passed
+        # at all, not when the named file turns out to be unusable.
         return None
     except Exception as e:
         logging.error(f"Error reading active service list file: {e}")
@@ -70,11 +79,20 @@ def is_enabled(value):
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
+        # One is the only number that counts. A level of 2, or a float
+        # 1.0 from a JSON document, reads as not enabled here, while
+        # the string forms in the set below are accepted generously.
+        # The asymmetry is inherited from how these files are usually
+        # written, and it is worth knowing it is there.
         return value == 1
     if isinstance(value, str):
         return value.strip().lower() in ENABLED_STRINGS
     return False
 
+# Only mappings are walked. A services section written as a
+# list of entries is not a mapping, so it contributes nothing
+# and raises nothing: every service in it passes unexamined,
+# and the file still counts as analyzed in main.
 def collect_enabled(data, prefix=""):
     """Walk nested mappings recursively and yield (service, dotted path) for enabled leaves."""
     found = []
@@ -84,6 +102,11 @@ def collect_enabled(data, prefix=""):
             if isinstance(value, dict):
                 found.extend(collect_enabled(value, path))
             elif is_enabled(value):
+                # The service name I report is the leaf key, not the grouping
+                # above it. A config written as a service name holding an
+                # enabled flag therefore reports a service literally called
+                # enabled, and the active list is matched against that word,
+                # not against the service the operator meant.
                 found.append((str(key), path))
     return found
 
@@ -182,6 +205,10 @@ def main():
         analysis_failed = True
 
     if args.format == 'json':
+        # JSON output carries findings only. A run where a file failed
+        # to analyze writes the same empty list as a clean run, and
+        # only the exit code below says the two apart, so a consumer
+        # who reads the file and ignores the exit code is misled.
         output_data = json.dumps(all_inactive_services, indent=4)
     else:  # args.format == 'text'
         output_data = ""
